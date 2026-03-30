@@ -133,12 +133,16 @@ python ado_issue_tracker.py update --report analysis-report.md
 For each resolved work item, the tool:
 - Sets the **State** to `Security Issue Resolved`
 - **Assigns** the work item to the user specified by `--assign-to` or `ADO_ASSIGN_TO`
-- Adds a rich **HTML Discussion comment** with:
-  - Vulnerability title, severity, and status
-  - Current dependency version (or confirmation that the dependency was removed)
+- Posts **one discussion comment per vulnerability** (plus a summary header), each containing:
+  - Vulnerability title, severity, and resolution status
+  - Affected package, vulnerable version, fix version, and current version
+  - Original dependency chain
   - Links to the relevant `pom.xml` and project release on GitHub
   - Link to the security advisory (e.g., Snyk URL)
-  - Credit to `java-ai-issue-tracker-ado` as the auto-resolution tool
+  - Resolution detail explaining how the issue was resolved
+- Posts a **summary header comment** at the top crediting `java-ai-issue-tracker-ado`
+
+> **Note:** Comments are posted in reverse order so that ADO (which displays newest comments first) shows them in the correct reading order: header at the top, then Vulnerability 1, 2, 3, etc.
 
 **Options:**
 ```bash

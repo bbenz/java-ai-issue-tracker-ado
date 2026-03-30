@@ -4,7 +4,6 @@ import base64
 import json
 import logging
 import subprocess
-import tempfile
 import time
 
 import requests
@@ -12,6 +11,40 @@ import requests
 logger = logging.getLogger(__name__)
 
 ADO_RESOURCE_ID = "499b84ac-1321-427f-aa17-267ca6975798"
+
+
+def _sanitize_for_cli(text: str) -> str:
+    """Replace non-ASCII characters with HTML entities or ASCII equivalents.
+
+    The Windows az CLI uses cp1252 encoding internally which can't handle
+    Unicode characters like em dashes, arrows, or emoji. Convert them to
+    HTML entities so ADO renders them correctly.
+    """
+    replacements = {
+        "\u2014": "&mdash;",     # —
+        "\u2013": "&ndash;",     # –
+        "\u2192": "&rarr;",      # →
+        "\u2190": "&larr;",      # ←
+        "\u2265": "&ge;",        # ≥
+        "\u2264": "&le;",        # ≤
+        "\u221e": "&infin;",     # ∞
+        "\u2713": "&#10003;",    # ✓
+        "\u2717": "&#10007;",    # ✗
+        "\u2705": "&#9989;",     # ✅
+        "\U0001f6e1": "&#128737;",  # 🛡️
+        "\U0001f512": "&#128274;",  # 🔒
+        "\U0001f916": "&#129302;",  # 🤖
+    }
+    for char, entity in replacements.items():
+        text = text.replace(char, entity)
+    # Catch any remaining non-ASCII characters
+    safe = []
+    for ch in text:
+        if ord(ch) > 127:
+            safe.append(f"&#{ord(ch)};")
+        else:
+            safe.append(ch)
+    return "".join(safe)
 
 
 class AdoClient:
@@ -98,13 +131,22 @@ class AdoClient:
         cmd = ["az"] + args + ["--org", self.org_url, "--output", "json"]
         logger.debug("Running: %s", " ".join(cmd))
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd, capture_output=True, timeout=timeout,
         )
+        # Decode output, trying utf-8 first then cp1252 (Windows az CLI)
+        try:
+            stdout = result.stdout.decode("utf-8")
+        except UnicodeDecodeError:
+            stdout = result.stdout.decode("cp1252", errors="replace")
+        try:
+            stderr = result.stderr.decode("utf-8")
+        except UnicodeDecodeError:
+            stderr = result.stderr.decode("cp1252", errors="replace")
         if result.returncode != 0:
             raise RuntimeError(
-                f"az CLI failed (exit {result.returncode}): {result.stderr.strip()}"
+                f"az CLI failed (exit {result.returncode}): {stderr.strip()}"
             )
-        return json.loads(result.stdout)
+        return json.loads(stdout)
 
     # -- Low-level HTTP (used when az CLI isn't available) --------------------
 
@@ -206,42 +248,23 @@ class AdoClient:
     ) -> dict:
         """Update a work item's state, assignment, and add a discussion comment.
 
-        For az CLI: splits into two calls to avoid shell argument length limits
-        when the discussion HTML is large (e.g., 30+ vulnerabilities).
+        Uses az CLI for state/assignment, and az rest for the discussion comment
+        to avoid shell argument length limits with large HTML.
         """
         if self._has_az_devops:
-            # Step 1: Update state + assignment
+            # Extract email from "Name <email>" format for az CLI compatibility
+            assign_value = assigned_to
+            if "<" in assigned_to and ">" in assigned_to:
+                assign_value = assigned_to.split("<")[1].rstrip(">").strip()
+            # Step 1: Update state + assignment via az boards
             self._az_cli([
                 "boards", "work-item", "update",
                 "--id", str(work_item_id),
                 "--state", state,
-                "--fields", f"System.AssignedTo={assigned_to}",
+                "--fields", f"System.AssignedTo={assign_value}",
             ])
-            # Step 2: Add discussion via temp file to avoid arg length limits
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".html", delete=False, encoding="utf-8"
-            ) as f:
-                f.write(discussion)
-                tmp_path = f.name
-            try:
-                return self._az_cli([
-                    "boards", "work-item", "update",
-                    "--id", str(work_item_id),
-                    "--discussion", f"@{tmp_path}",
-                ])
-            except RuntimeError:
-                # If @file syntax isn't supported, fall back to truncated inline
-                logger.warning(
-                    "Failed to add discussion via file for %d, trying inline (truncated)",
-                    work_item_id,
-                )
-                # Truncate to ~4000 chars to stay within shell limits
-                short = discussion[:4000] + "\n<p><em>(truncated — full detail in analysis-report.md)</em></p>"
-                return self._az_cli([
-                    "boards", "work-item", "update",
-                    "--id", str(work_item_id),
-                    "--discussion", short,
-                ])
+            # Step 2: Add discussion via az rest (no arg length limit)
+            return self._add_comment_via_rest(work_item_id, discussion)
         body = [
             {"op": "replace", "path": "/fields/System.State", "value": state},
             {"op": "replace", "path": "/fields/System.AssignedTo", "value": assigned_to},
@@ -252,27 +275,58 @@ class AdoClient:
             {"text": discussion},
         )
 
+    def _add_comment_via_rest(self, work_item_id: int, comment: str) -> dict:
+        """Add a discussion comment using direct REST API with az login token.
+        Falls back to az boards --discussion with ASCII-safe HTML if REST fails.
+        """
+        url = (
+            f"{self.org_url}/{self.project}/_apis/wit/workitems/"
+            f"{work_item_id}/comments?api-version=7.1-preview.4"
+        )
+        # Try REST API with bearer token first
+        try:
+            result = subprocess.run(
+                [
+                    "az", "account", "get-access-token",
+                    "--resource", ADO_RESOURCE_ID,
+                    "--query", "accessToken",
+                    "--output", "tsv",
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                token = result.stdout.strip()
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                }
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json={"text": comment},
+                    timeout=30,
+                )
+                if resp.status_code in (200, 201):
+                    return resp.json()
+                logger.debug(
+                    "REST comment failed for %d (HTTP %d), using az boards fallback",
+                    work_item_id, resp.status_code,
+                )
+        except Exception as e:
+            logger.debug("REST token error for %d: %s", work_item_id, e)
+
+        # Fallback: az boards --discussion with ASCII-safe HTML
+        safe_comment = _sanitize_for_cli(comment)
+        return self._az_cli([
+            "boards", "work-item", "update",
+            "--id", str(work_item_id),
+            "--discussion", safe_comment,
+        ])
+
     def add_work_item_comment(self, work_item_id: int, comment: str) -> dict:
         """Add a discussion comment to a work item."""
         if self._has_az_devops:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".html", delete=False, encoding="utf-8"
-            ) as f:
-                f.write(comment)
-                tmp_path = f.name
-            try:
-                return self._az_cli([
-                    "boards", "work-item", "update",
-                    "--id", str(work_item_id),
-                    "--discussion", f"@{tmp_path}",
-                ])
-            except RuntimeError:
-                short = comment[:4000] + "\n<p><em>(truncated)</em></p>"
-                return self._az_cli([
-                    "boards", "work-item", "update",
-                    "--id", str(work_item_id),
-                    "--discussion", short,
-                ])
+            return self._add_comment_via_rest(work_item_id, comment)
         return self._post(
             f"/wit/workitems/{work_item_id}/comments?api-version=7.1-preview.4",
             {"text": comment},

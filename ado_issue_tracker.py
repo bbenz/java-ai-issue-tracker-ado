@@ -290,21 +290,32 @@ def cmd_update(args: argparse.Namespace) -> None:
         vulns = item.get("vulnerabilities", [])
         parent = item.get("parent_project", "Unknown")
         try:
-            comment = _build_resolution_comment(vulns, parent, now)
-
-            # Update state + assign + comment in one call
+            # Update state + assignment (no discussion yet)
             ado.update_work_item(
                 wi_id,
                 state=args.target_state,
                 assigned_to=args.assign_to,
-                discussion=comment,
+                discussion="",
+            )
+
+            # Post vulnerabilities in reverse order so ADO displays them
+            # top-to-bottom (ADO shows newest comments first)
+            for i in range(len(vulns), 0, -1):
+                v = vulns[i - 1]
+                vuln_comment = _build_single_vuln_comment(v, i, len(vulns), parent, now)
+                ado.add_work_item_comment(wi_id, vuln_comment)
+                time.sleep(0.2)
+
+            # Post header last so it appears at the top of the discussion
+            ado.add_work_item_comment(
+                wi_id, _build_header_comment(len(vulns), parent, now)
             )
 
             log_entries.append(
                 {"work_item_id": wi_id, "status": "success", "timestamp": now}
             )
-            logging.info("Updated work item %d to %s", wi_id, args.target_state)
-            print(f"  ✓ {wi_id} — {args.target_state}")
+            logging.info("Updated work item %d to %s (%d comments)", wi_id, args.target_state, len(vulns) + 1)
+            print(f"  ✓ {wi_id} — {args.target_state} ({len(vulns)} vulnerabilities)")
             time.sleep(0.3)
 
         except Exception as e:
@@ -369,105 +380,99 @@ _CATEGORY_LABELS = {
 }
 
 
-def _build_resolution_comment(
-    vulns: list[dict], parent_project: str, timestamp: str
-) -> str:
-    """Build a verbose, human-readable HTML discussion comment."""
-    lines: list[str] = []
-    lines.append("<h2>🔒 Security Issue Auto-Resolved</h2>")
-    lines.append(
+def _build_header_comment(vuln_count: int, parent_project: str, timestamp: str) -> str:
+    """Build the initial summary comment posted with the state change."""
+    return (
+        "<h2>🔒 Security Issue Auto-Resolved</h2>"
         "<p><em>This issue was automatically analyzed and resolved by "
         "<strong>java-ai-issue-tracker-ado</strong>.</em></p>"
-    )
-    lines.append("<hr/>")
-
-    for i, v in enumerate(vulns, 1):
-        cat = v.get("category", "UNKNOWN")
-        cat_label = _CATEGORY_LABELS.get(cat, cat)
-        extra = v.get("extra_info", {})
-        current_ver = extra.get("current_version", "")
-        project_url = extra.get("project_url", "")
-        pom_url = extra.get("pom_url", "")
-
-        if len(vulns) > 1:
-            lines.append(f"<h3>Vulnerability {i} of {len(vulns)}</h3>")
-
-        lines.append(f"<p><strong>🛡️ {v.get('title', 'Unknown')}</strong> "
-                      f"({v.get('severity', 'Unknown')} Severity)</p>")
-        lines.append("<table>")
-
-        lines.append(f"<tr><td><strong>Status</strong></td>"
-                      f"<td>✅ {cat_label}</td></tr>")
-
-        lines.append(f"<tr><td><strong>Affected Package</strong></td>"
-                      f"<td><code>{v.get('vulnerable_package', '')}"
-                      f"@{v.get('vulnerable_version', '')}</code></td></tr>")
-
-        lines.append(f"<tr><td><strong>Fix Version</strong></td>"
-                      f"<td><code>{v.get('fix_version', '')}</code></td></tr>")
-
-        if current_ver:
-            lines.append(
-                f"<tr><td><strong>Current Version in {parent_project}</strong></td>"
-                f"<td><code>{current_ver}</code> "
-                f"(updated from <code>{v.get('vulnerable_version', '')}</code>)"
-                f"</td></tr>"
-            )
-        else:
-            if cat == "RESOLVED_DEPENDENCY_REMOVED":
-                lines.append(
-                    f"<tr><td><strong>Current Status in {parent_project}</strong></td>"
-                    f"<td>This dependency is <strong>no longer present</strong> in the "
-                    f"{parent_project} dependency tree. The vulnerable package "
-                    f"<code>{v.get('vulnerable_package', '')}</code> has been removed.</td></tr>"
-                )
-            elif cat == "RESOLVED_TRANSITIVE_UPDATE":
-                lines.append(
-                    f"<tr><td><strong>Current Status in {parent_project}</strong></td>"
-                    f"<td>This is a transitive dependency not directly managed in "
-                    f"{parent_project}'s POMs. The latest version on Maven Central "
-                    f"is at or above the fix version.</td></tr>"
-                )
-
-        lines.append(f"<tr><td><strong>Parent Project</strong></td>"
-                      f"<td>{parent_project}</td></tr>")
-
-        if v.get("dependency_chain"):
-            chain = v["dependency_chain"].replace(">", "→")
-            lines.append(f"<tr><td><strong>Original Dependency Chain</strong></td>"
-                          f"<td><code>{chain}</code></td></tr>")
-
-        if v.get("snyk_url"):
-            lines.append(
-                f"<tr><td><strong>Security Advisory</strong></td>"
-                f"<td><a href=\"{v['snyk_url']}\">{v['snyk_url']}</a></td></tr>"
-            )
-
-        if project_url:
-            lines.append(
-                f"<tr><td><strong>Project Release</strong></td>"
-                f"<td><a href=\"{project_url}\">{project_url}</a></td></tr>"
-            )
-
-        if pom_url:
-            lines.append(
-                f"<tr><td><strong>Relevant pom.xml</strong></td>"
-                f"<td><a href=\"{pom_url}\">{pom_url}</a></td></tr>"
-            )
-
-        lines.append("</table>")
-
-        lines.append(f"<p><strong>Resolution Detail:</strong> {v.get('detail', '')}</p>")
-        lines.append("<br/>")
-
-    lines.append("<hr/>")
-    lines.append(f"<p><strong>Verified:</strong> {timestamp}</p>")
-    lines.append(
+        f"<p><strong>{vuln_count} vulnerabilities</strong> found in "
+        f"<strong>{parent_project}</strong>. "
+        f"Each vulnerability is documented in a separate comment below.</p>"
+        f"<p><strong>Verified:</strong> {timestamp}</p>"
         "<p><em>🤖 Auto-resolved by "
         "<a href=\"https://github.com/bbenz/java-ai-issue-tracker-ado\">"
-        "java-ai-issue-tracker-ado</a> \u2014 an automated security issue triage tool "
+        "java-ai-issue-tracker-ado</a> — an automated security issue triage tool "
         "for Azure DevOps.</em></p>"
     )
+
+
+def _build_single_vuln_comment(
+    v: dict, index: int, total: int, parent_project: str, timestamp: str
+) -> str:
+    """Build an HTML comment for a single vulnerability."""
+    cat = v.get("category", "UNKNOWN")
+    cat_label = _CATEGORY_LABELS.get(cat, cat)
+    extra = v.get("extra_info", {})
+    current_ver = extra.get("current_version", "")
+    project_url = extra.get("project_url", "")
+    pom_url = extra.get("pom_url", "")
+
+    lines: list[str] = []
+    lines.append(f"<h3>Vulnerability {index} of {total}</h3>")
+    lines.append(f"<p><strong>🛡️ {v.get('title', 'Unknown')}</strong> "
+                  f"({v.get('severity', 'Unknown')} Severity)</p>")
+    lines.append("<table>")
+
+    lines.append(f"<tr><td><strong>Status</strong></td>"
+                  f"<td>✅ {cat_label}</td></tr>")
+
+    lines.append(f"<tr><td><strong>Affected Package</strong></td>"
+                  f"<td><code>{v.get('vulnerable_package', '')}"
+                  f"@{v.get('vulnerable_version', '')}</code></td></tr>")
+
+    lines.append(f"<tr><td><strong>Fix Version</strong></td>"
+                  f"<td><code>{v.get('fix_version', '')}</code></td></tr>")
+
+    if current_ver:
+        lines.append(
+            f"<tr><td><strong>Current Version in {parent_project}</strong></td>"
+            f"<td><code>{current_ver}</code> "
+            f"(updated from <code>{v.get('vulnerable_version', '')}</code>)"
+            f"</td></tr>"
+        )
+    else:
+        if cat == "RESOLVED_DEPENDENCY_REMOVED":
+            lines.append(
+                f"<tr><td><strong>Current Status in {parent_project}</strong></td>"
+                f"<td>This dependency is <strong>no longer present</strong> in the "
+                f"{parent_project} dependency tree.</td></tr>"
+            )
+        elif cat == "RESOLVED_TRANSITIVE_UPDATE":
+            lines.append(
+                f"<tr><td><strong>Current Status in {parent_project}</strong></td>"
+                f"<td>Transitive dependency — latest version on Maven Central "
+                f"is at or above the fix version.</td></tr>"
+            )
+
+    lines.append(f"<tr><td><strong>Parent Project</strong></td>"
+                  f"<td>{parent_project}</td></tr>")
+
+    if v.get("dependency_chain"):
+        chain = v["dependency_chain"].replace(">", "→")
+        lines.append(f"<tr><td><strong>Original Dependency Chain</strong></td>"
+                      f"<td><code>{chain}</code></td></tr>")
+
+    if v.get("snyk_url"):
+        lines.append(
+            f"<tr><td><strong>Security Advisory</strong></td>"
+            f"<td><a href=\"{v['snyk_url']}\">{v['snyk_url']}</a></td></tr>"
+        )
+
+    if project_url:
+        lines.append(
+            f"<tr><td><strong>Project Release</strong></td>"
+            f"<td><a href=\"{project_url}\">{project_url}</a></td></tr>"
+        )
+
+    if pom_url:
+        lines.append(
+            f"<tr><td><strong>Relevant pom.xml</strong></td>"
+            f"<td><a href=\"{pom_url}\">{pom_url}</a></td></tr>"
+        )
+
+    lines.append("</table>")
+    lines.append(f"<p><strong>Resolution Detail:</strong> {v.get('detail', '')}</p>")
 
     return "\n".join(lines)
 
